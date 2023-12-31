@@ -1,9 +1,25 @@
 import pandas as pd
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, Trainer, TrainingArguments, TextClassificationPipeline
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, Trainer, TrainingArguments, TextClassificationPipeline, DataCollatorWithPadding
 import logging
 from datasets import Dataset, concatenate_datasets
+import torch
 
 logging.basicConfig(level=logging.INFO)
+
+# This collator avoids truncating content by padding to the maximum length in the batch, rather than statically setting the maximum length in the dataset.
+class TensorDataCollator(DataCollatorWithPadding):
+    def __init__(self, tokenizer):
+        super().__init__(tokenizer)
+
+    def collate_batch(self, batch):
+        # Handle list of dictionaries
+        input_ids = torch.stack([item["input_ids"] for item in batch])
+        attention_mask = torch.stack([item["attention_mask"] for item in batch])
+        if "labels" in batch[0]:  # Check if labels exist
+            labels = torch.stack([item["labels"] for item in batch])
+        else:
+            labels = None
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 def train_model(labelled_csv="messages-labelled-s.csv", unlabelled_csv="messages-unlabelled.csv", eval_csv="messages-labelled-s-eval.csv"):
     """Trains a model using both labelled and unlabelled data with semi-supervised learning."""
@@ -17,8 +33,8 @@ def train_model(labelled_csv="messages-labelled-s.csv", unlabelled_csv="messages
     tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-small-en-v1.5")
 
     # Prepare the datasets for the model
-    train_encodings = tokenizer(labelled_df["text"].tolist(), truncation=True, padding='max_length', max_length=173, return_tensors="pt")
-    eval_encodings = tokenizer(eval_df["text"].tolist(), truncation=True, padding='max_length', max_length=173, return_tensors="pt")
+    train_encodings = tokenizer(labelled_df["text"].tolist(), truncation=True, padding=True, return_tensors="pt")
+    eval_encodings = tokenizer(eval_df["text"].tolist(), truncation=True, padding=True, return_tensors="pt")
 
     # Map labels to numbers
     label_map = {"code": 1, "no code": 0}
@@ -41,16 +57,18 @@ def train_model(labelled_csv="messages-labelled-s.csv", unlabelled_csv="messages
     )
 
     # Initial training on labeled data
+    data_collator = TensorDataCollator(tokenizer)
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
+        data_collator=data_collator,
     )
 
     # Pseudo-labeling for unlabeled data
     unlabelled_df = unlabelled_df.dropna(subset=['text'])
-    unlabelled_encodings = tokenizer(unlabelled_df["text"].tolist(), truncation=True, padding='max_length', max_length=173, return_tensors="pt")
+    unlabelled_encodings = tokenizer(unlabelled_df["text"].tolist(), truncation=True, padding=True, return_tensors="pt")
     unlabelled_dataset = Dataset.from_dict({"input_ids": unlabelled_encodings["input_ids"], "attention_mask": unlabelled_encodings["attention_mask"]})
     
     # Make predictions on unlabeled data
@@ -74,6 +92,7 @@ def train_model(labelled_csv="messages-labelled-s.csv", unlabelled_csv="messages
         args=training_args,
         train_dataset=combined_train_dataset,
         eval_dataset=eval_dataset,
+        data_collator=data_collator,
     )
     trainer.train()
 
@@ -95,7 +114,7 @@ def use_model(messages, model_path="security-code-detector-semisupervised-alt"):
     predictions = pipeline(messages)
 
     # Map numeric predictions back to string labels
-    label_map = {1: "code", 0: "no code"}
+    label_map = {"LABEL_1": "code", "LABEL_0": "no code"}
     predictions = [label_map[p['label']] for p in predictions]
 
     return predictions
@@ -105,6 +124,6 @@ def use_model(messages, model_path="security-code-detector-semisupervised-alt"):
 train_model()
 
 # To use the model after training:
-messages = ["This is a message with a code: 12345", "This message has no code"]
+messages = ["This is a message with a code: 12345", "This message has no code", "This message has a code: but no"]
 predictions = use_model(messages)
-print(predictions)  # Output: ["code", "no code"]
+print(predictions)  # Output: ["code", "no code", "no code"]
