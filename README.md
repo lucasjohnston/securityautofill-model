@@ -8,7 +8,7 @@ To turn our messages.csv into a useful train.csv and eval.csv file, we need to l
 I spent about half an hour looking into automatic options and tools like Doccano, Prodigy, and Label Studio, before finding them all (to varying degrees) a massive waste of time. In the end I just cranked out Numbers and went hell-for-leather on various filters on the data to tease out interesting examples – specifically OTPs in different languages, and OTPs that don't contain obvious words like "code" or "security" or "OTP" etc.
 
 This resulted in about ~600 "codes" and ~1000 "not codes" labelled in `messages-labelled.csv`, and around ~10,000 unlabelled records in `messages-unlabelled.csv`.
-I then split the labelled training data 70%/30% into `messages-labelled-s.csv` and `messages-labelled-s-eval.csv` respectively, so that there could be some evaluation in the process of the model's training.
+I then split the labelled training data 70%/30% into `messages-train.csv` and `messages-eval.csv` respectively, so that there could be some evaluation in the process of the model's training.
 
 ## Training the model
 

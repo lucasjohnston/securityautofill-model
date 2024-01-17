@@ -1,7 +1,7 @@
 import pandas as pd
 from setfit import SetFitModel, Trainer, TrainingArguments
 
-def train_model(labelled_csv="messages-labelled-s.csv", eval_csv="messages-labelled-s-eval.csv"):
+def train_model(labelled_csv="messages-train.csv", eval_csv="messages-eval.csv"):
     """Trains a SetFit model to identify security codes in messages."""
 
     # Load the labelled dataset
@@ -32,9 +32,8 @@ def train_model(labelled_csv="messages-labelled-s.csv", eval_csv="messages-label
     )
     trainer.train()
     
-    # Save the trained model
+    # Save the newly trained model
     model.save_pretrained("security-code-detector-setfit")
-    model.push_to_hub("lujstn/security-code-detector-setfit")
 
 def use_model(messages, model_path="security-code-detector-setfit"):
    """Uses a trained SetFit model to predict security codes in messages."""
@@ -45,12 +44,13 @@ def use_model(messages, model_path="security-code-detector-setfit"):
    # Make predictions
    predictions = model.predict(messages)
 
+   # ⚠️ If you've tested the model and are happy with its predictions, uncomment to push the model to the Hub:
+   # model.push_to_hub("lujstn/security-code-detector-setfit")
+
    return predictions
 
-# Example usage:
-
-# To train the model:
-train_model()
+# ⚠️ To train the model, uncomment the following line:
+# train_model()
 
 # To use the model after training:
 messages = ["This is a message with a code: 12345", "This message has no code"]
