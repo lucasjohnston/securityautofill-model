@@ -77,9 +77,11 @@ def train_model(labelled_csv="messages-train.csv", unlabelled_csv="messages-unla
         num_train_epochs=20,
         per_device_train_batch_size=32,
         evaluation_strategy="epoch",
+        save_strategy="epoch",
         seed=42,
         learning_rate=5e-5,
         weight_decay=0.01,
+        load_best_model_at_end=True,
     )
 
     # Make predictions on unlabeled data
@@ -136,7 +138,7 @@ def use_model(messages, model_path="security-code-detector-semisupervised"):
     return predictions
 
 # ⚠️ To train the model, uncomment the following line:
-# train_model()
+train_model()
 
 # To use the model after training:
 messages = ["This is a message with a code: 12345", "This message has no code", "This message has a code: but no"]

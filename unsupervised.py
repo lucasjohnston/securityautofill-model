@@ -1,14 +1,12 @@
-import pandas as pd
+from datasets import load_dataset
 from setfit import SetFitModel, Trainer, TrainingArguments
 
 def train_model(labelled_csv="messages-train.csv", eval_csv="messages-eval.csv"):
     """Trains a SetFit model to identify security codes in messages."""
 
-    # Load the labelled dataset
-    labelled_df = pd.read_csv(labelled_csv)
-    eval_csv = pd.read_csv(eval_csv)
-    train_dataset = labelled_df.to_dict("records")
-    eval_dataset = labelled_df.to_dict("records")
+    # Load the datasets
+    train_dataset = load_dataset("csv", data_files=labelled_csv)["train"]
+    eval_dataset = load_dataset("csv", data_files=eval_csv)["train"]
     
     # Initialize the model
     model = SetFitModel.from_pretrained("BAAI/bge-small-en-v1.5", labels=["no code", "code"])
@@ -50,7 +48,7 @@ def use_model(messages, model_path="security-code-detector-setfit"):
    return predictions
 
 # ⚠️ To train the model, uncomment the following line:
-# train_model()
+train_model()
 
 # To use the model after training:
 messages = ["This is a message with a code: 12345", "This message has no code"]
