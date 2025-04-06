@@ -6,12 +6,15 @@ from span_marker.modeling import SpanMarkerModelCardData
 import argilla as rg
 from pathlib import Path
 import torch # Import torch to check for MPS availability
+import pandas as pd # Added for deduplication
+import shutil # Added for file backup
 
 # --- Configuration ---
 # Argilla config
 ARGILLA_API_URL = "http://localhost:6900" # Replace with your Argilla server URL
 ARGILLA_API_KEY = "argilla.apikey"      # Replace with your Argilla API key
-ARGILLA_DATASET_NAME = "messages_ner_labelling"
+RG_WORKSPACE_NAME = "default"           # Explicitly set the workspace name (use None to fallback to default user workspace)
+RG_DATASET_NAME = "messages_ner_labelling" # Renamed from ARGILLA_DATASET_NAME
 
 # Data files
 UNLABELLED_CSV = "messages-unlabelled.csv"
@@ -34,6 +37,7 @@ MODEL_MAX_LENGTH = 256 # Max sequence length for the model
 
 # --- Argilla Initialization ---
 try:
+    # Initialize client (workspace is typically handled per-dataset)
     client = rg.Argilla(api_url=ARGILLA_API_URL, api_key=ARGILLA_API_KEY)
     print("Successfully connected to Argilla.")
 except Exception as e:
@@ -66,13 +70,57 @@ def find_potential_codes(text):
 # --- Workflow Steps ---
 
 # Step 1: Prepare and label messages for NER in Argilla.
-def label_messages_for_ner(unlabelled_csv=UNLABELLED_CSV, num_examples=NUM_EXAMPLES_TO_LABEL, dataset_name=ARGILLA_DATASET_NAME):
-    """Loads messages, pre-suggests codes, and logs to Argilla for NER labelling."""
+def label_messages_for_ner(unlabelled_csv=UNLABELLED_CSV, num_examples=NUM_EXAMPLES_TO_LABEL, dataset_name=RG_DATASET_NAME, workspace_name=RG_WORKSPACE_NAME):
+    """Loads messages, optionally removes duplicates, pre-suggests codes, and logs to Argilla for NER labelling."""
     print(f"Loading raw data from {unlabelled_csv}...")
-    # Load raw text data
-    raw_dataset = load_dataset("csv", data_files=unlabelled_csv)["train"]
+
+    # --- Optional Deduplication ---
+    deduplicate = input(f"Do you want to remove duplicate messages from '{unlabelled_csv}' first? (Recommended to prevent ID conflicts) (y/n): ").lower().strip()
+    if deduplicate == 'y':
+        try:
+            print(f"Reading '{unlabelled_csv}' for deduplication...")
+            df = pd.read_csv(unlabelled_csv)
+            original_count = len(df)
+            if 'text' not in df.columns:
+                raise ValueError("CSV must contain a 'text' column for deduplication.")
+
+            # Backup original file
+            backup_path = Path(f"{unlabelled_csv}.bak")
+            print(f"Backing up original file to '{backup_path}'...")
+            shutil.copyfile(unlabelled_csv, backup_path)
+
+            # Deduplicate
+            df.drop_duplicates(subset=['text'], keep='first', inplace=True)
+            new_count = len(df)
+            duplicates_removed = original_count - new_count
+
+            if duplicates_removed > 0:
+                print(f"Removed {duplicates_removed} duplicate message(s). Overwriting '{unlabelled_csv}' with unique messages...")
+                df.to_csv(unlabelled_csv, index=False)
+            else:
+                print("No duplicate messages found.")
+
+        except FileNotFoundError:
+            print(f"Error: Source file '{unlabelled_csv}' not found. Skipping deduplication.")
+        except Exception as e:
+            print(f"Error during deduplication: {e}. Continuing without deduplication.")
+            # Optionally restore from backup if needed, but safer to continue with original for now
+            # shutil.copyfile(backup_path, unlabelled_csv)
+
+
+    # --- Load (potentially deduplicated) raw text data ---
+    try:
+        raw_dataset = load_dataset("csv", data_files=unlabelled_csv)["train"]
+        print(f"Loaded {len(raw_dataset)} records from '{unlabelled_csv}'.")
+    except Exception as e:
+        print(f"Fatal Error: Could not load dataset from '{unlabelled_csv}' after attempting deduplication. Check the file. Error: {e}")
+        return # Stop if loading fails
 
     # Select a sample for labelling
+    if len(raw_dataset) < num_examples:
+        print(f"Warning: Requested {num_examples} examples, but only {len(raw_dataset)} available after loading/deduplication. Using all available.")
+        num_examples = len(raw_dataset)
+
     sample_dataset = raw_dataset.shuffle(seed=TRAIN_TEST_SPLIT_SEED).select(range(num_examples))
 
     print(f"Preparing {num_examples} examples for Argilla NER labelling...")
@@ -97,11 +145,22 @@ def label_messages_for_ner(unlabelled_csv=UNLABELLED_CSV, num_examples=NUM_EXAMP
 
     # --- Create Records with Suggestions ---
     records = []
+    # Keep track of hashes seen in this batch to prevent duplicates *within the sample* if source wasn't deduplicated
+    hashes_in_batch = set()
+    skipped_duplicates_in_batch = 0
+
     for example in sample_dataset:
         text = example["text"]
         if not text or not isinstance(text, str):
             print(f"Skipping invalid text entry: {example}")
             continue
+
+        record_id = hash(text)
+        if record_id in hashes_in_batch:
+            skipped_duplicates_in_batch += 1
+            continue # Skip duplicate within the selected sample
+        hashes_in_batch.add(record_id)
+
 
         # Find potential codes using the heuristic
         potential_codes = find_potential_codes(text)
@@ -130,59 +189,88 @@ def label_messages_for_ner(unlabelled_csv=UNLABELLED_CSV, num_examples=NUM_EXAMP
             fields={"text": text}, # Text field content
             suggestions=record_suggestions, # Pass the list containing the single Suggestion object
             metadata={"tokens": text.split()}, # Simple tokenization for metadata
-            id=hash(text)
+            id=record_id # Use the calculated hash
         )
         records.append(record)
 
+    if skipped_duplicates_in_batch > 0:
+         print(f"Note: Skipped {skipped_duplicates_in_batch} duplicate messages found within the random sample of {num_examples}.")
+
     # Log to Argilla
-    print(f"Logging {len(records)} records to Argilla dataset '{dataset_name}'...")
+    print(f"Attempting to log {len(records)} records to Argilla dataset '{dataset_name}' in workspace '{workspace_name or 'default'}'...")
     try:
-        # === Step 1: Create/Define the Dataset in Argilla ===
-        print(f"Creating/updating dataset definition '{dataset_name}' in Argilla...")
-        # Delete existing dataset if needed (be cautious)
+        # === Step 1: Check for Existing Dataset and Handle Conflict ===
+        dataset = None
         try:
-            existing_dataset = client.datasets.for_name(dataset_name)
+            # Attempt to fetch the dataset by name within the specified workspace
+            existing_dataset = client.datasets(name=dataset_name, workspace=workspace_name) # Use client.datasets(name=...)
             if existing_dataset:
-                 print(f"Dataset '{dataset_name}' already exists. Skipping definition creation.")
-                 dataset = existing_dataset # Use the existing dataset object
+                print(f"Dataset '{dataset_name}' already exists in workspace '{workspace_name or 'default'}'.")
+
+                # Ask user how to proceed
+                while True:
+                    choice = input(f"  Overwrite existing dataset '{dataset_name}' (y) or append new records (n)? ").lower().strip()
+                    if choice == 'y':
+                        print(f"  Deleting existing dataset '{dataset_name}'...")
+                        existing_dataset.delete() # Call delete on the dataset object
+                        print("  Recreating dataset definition...")
+                        # Define the dataset object *without* records first
+                        dataset_definition = rg.Dataset(name=dataset_name, workspace=workspace_name, settings=settings)
+                        dataset_definition.create() # Call create on the new dataset object
+                        dataset = dataset_definition # Use the new object
+                        print("  Dataset recreated.")
+                        break
+                    elif choice == 'n':
+                        print("  Will append records to the existing dataset.")
+                        dataset = existing_dataset # Use the existing dataset object for logging
+                        break
+                    else:
+                        print("  Invalid choice. Please enter 'y' or 'n'.")
             else:
-                 raise RuntimeError("Dataset.for_name returned None unexpectedly") # Should not happen if no exception
-        except Exception: # Replace with specific NotFoundError if available/imported
-            print(f"Dataset '{dataset_name}' not found. Creating new definition...")
-            # Create the dataset object *without* records
-            dataset_definition = rg.Dataset(
-                name=dataset_name,
-                settings=settings # Use the defined settings object
-            )
-            # Add the dataset definition to Argilla
-            dataset = client.datasets.add(dataset_definition) # Store the returned dataset object
-            print(f"Dataset definition created in Argilla.")
+                # client.datasets returns None if not found
+                print(f"Dataset '{dataset_name}' not found in workspace '{workspace_name or 'default'}'. Creating new definition...")
+                dataset_definition = rg.Dataset(name=dataset_name, workspace=workspace_name, settings=settings)
+                dataset_definition.create()
+                dataset = dataset_definition
+                print(f"Dataset definition created in Argilla.")
 
-        # === Step 2: Log the Records to the Dataset ===
-        print(f"Logging {len(records)} records to dataset '{dataset_name}'...")
-        # Log records to the specific dataset object, not the client
-        log_response = dataset.records.log(records=records) 
-        print(f"Records logged: Processed={log_response.processed}, Failed={log_response.failed}")
 
-        # Get the URL from the dataset object
-        dataset_url = getattr(dataset, 'url', 'URL not available')
-        print(f"Dataset available in Argilla at: {dataset_url}")
-        print("➡️ Please go to the Argilla UI, review the suggestions, and correct/add labels for the 'CODE' entity.")
+        except Exception as e:
+            # Catch other potential errors during check/creation/deletion
+            print(f"An unexpected error occurred during dataset setup: {e}")
+            raise # Re-raise unexpected errors
+
+
+        # === Step 2: Log the Records to the (Now Confirmed) Dataset ===
+        if dataset: # Ensure we have a valid dataset object before logging
+            print(f"Sending {len(records)} records to Argilla...") # Added log before sending
+            # Log records to the specific dataset object, not the client
+            # Batch size is handled internally by the log method, SDK will warn if adjusted.
+            log_response = dataset.records.log(records=records)
+            print(f"Records logged: Processed={log_response.processed}, Failed={log_response.failed}")
+
+            # Get the URL from the dataset object
+            dataset_url = getattr(dataset, 'url', 'URL not available')
+            print(f"Dataset available in Argilla at: {dataset_url}")
+            print("➡️ Please go to the Argilla UI, review the suggestions, and correct/add labels for the 'CODE' entity.")
+        else:
+            print("Error: Could not obtain a valid dataset object to log records.")
+
 
     except Exception as e:
-        print(f"Error interacting with Argilla: {e}")
+        # Catch potential errors during deletion, recreation, or logging
+        print(f"Error interacting with Argilla during dataset handling or logging: {e}")
 
 # ⚠️ To prepare data for labelling, uncomment the following line:
-label_messages_for_ner()
-
+label_messages_for_ner() # Pass workspace_name if not using 'default'
 
 # Step 2: Train the SpanMarkerNER model using labelled data from Argilla.
-def train_span_marker_model(dataset_name=ARGILLA_DATASET_NAME, model_output_dir=MODEL_OUTPUT_DIR):
+def train_span_marker_model(dataset_name=RG_DATASET_NAME, model_output_dir=MODEL_OUTPUT_DIR, workspace_name=RG_WORKSPACE_NAME):
     """Trains a SpanMarkerNER model using data labelled in Argilla."""
-    print(f"Loading labelled data from Argilla dataset '{dataset_name}'...")
+    print(f"Loading labelled data from Argilla dataset '{dataset_name}' in workspace '{workspace_name or 'default'}'...")
     try:
-        # Load the dataset from Argilla - make sure to specify the correct question name
-        dataset_rg = rg.load(dataset_name, query="status:submitted", limit=None) # Load all submitted records
+        # Load the dataset from Argilla - specify workspace if not default
+        dataset_rg = rg.load(dataset_name, query="status:submitted", limit=None, workspace=workspace_name) # Load all submitted records
         if not dataset_rg:
             print(f"No submitted records found in Argilla dataset '{dataset_name}'. Please label data first.")
             return None
@@ -384,7 +472,6 @@ def train_span_marker_model(dataset_name=ARGILLA_DATASET_NAME, model_output_dir=
     # Also save the tokenizer with the model
     tokenizer.save_pretrained(str(final_model_path))
 
-
 # ⚠️ To train the model after labelling, uncomment the following line:
 # train_span_marker_model()
 
@@ -434,8 +521,7 @@ def extract_codes_with_model(messages, model_path=MODEL_OUTPUT_DIR / "checkpoint
 
    return extracted_codes
 
-# --- Example Usage ---
-# To directly use the model after training, uncomment the following lines:
+# ⚠️ To directly use the model after training, uncomment the following lines:
 # test_messages = [
 #    "G-861121 is your Google verification code.",
 #    "Your Respondent verification code is: 958261",
@@ -452,16 +538,10 @@ def extract_codes_with_model(messages, model_path=MODEL_OUTPUT_DIR / "checkpoint
 #        print(f"Extracted Codes: {codes}")
 #        print("-" * 10)
 
+# ⚠️ If you've tested the model and are happy, you could push it to the Hub
+# To do this, uncomment the relevant lines in the extract_codes_with_model function above and run the script.
+
 # --- Main Execution Guard ---
 if __name__ == "__main__":
-    print("Running main.py script...")
-    print("This script defines functions for labelling, training, and using a SpanMarkerNER model.")
-    print("Uncomment the function calls for the steps you want to perform.")
-
-    # Example flow:
-    # 1. Uncomment label_messages_for_ner() and run the script.
-    # 2. Go to the Argilla UI and label the data in the 'messages_ner_labelling' dataset.
-    # 3. Comment out label_messages_for_ner(), uncomment train_span_marker_model(), and run the script.
-    # 4. Comment out train_span_marker_model(), uncomment the example usage block at the end, and run to test.
-
+    print("Thank you for using Security Autofill 🙇")
     pass # Keeps the script runnable without uncommenting steps
