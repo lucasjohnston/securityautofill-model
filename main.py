@@ -22,15 +22,13 @@ RG_DATASET_NAME = "messages_ner_labelling" # Renamed from ARGILLA_DATASET_NAME
 UNLABELLED_CSV = "messages-unlabelled.csv"
 
 # Model config
-BASE_MODEL = "Alibaba-NLP/gte-modernbert-base" # Lightweight multilingual model
-# FacebookAI/xlm-roberta-base
+BASE_MODEL = "bert-base-multilingual-cased" # Lightweight multilingual model
 # Alibaba-NLP/gte-modernbert-base
+# FacebookAI/xlm-roberta-base
 # intfloat/multilingual-e5-base
 # Alibaba-NLP/gte-base-en-v1.5
 # Mayank6255/GLiNER-MoE-MultiLingual
 # bert-base-multilingual-cased
-
-
 
 NEW_MODEL_NAME = f"span-marker-{BASE_MODEL.split('/')[-1]}-security-codes"
 MODEL_OUTPUT_DIR = Path("models") / NEW_MODEL_NAME
@@ -41,8 +39,8 @@ NUM_EXAMPLES_TO_LABEL = 200
 TRAIN_TEST_SPLIT_SEED = 42
 TRAIN_BATCH_SIZE = 8 # Adjust based on your M2 Max memory
 EVAL_BATCH_SIZE = 8
-NUM_EPOCHS = 3     # SpanMarker often requires fewer epochs than SetFit
-LEARNING_RATE = 5e-5
+NUM_EPOCHS = 10     # SpanMarker often requires fewer epochs than SetFit - Increased epochs
+LEARNING_RATE = 2e-5 # Lowered learning rate
 WARMUP_RATIO = 0.1
 MODEL_MAX_LENGTH = 256 # Max sequence length for the model
 
@@ -298,6 +296,7 @@ def train_span_marker_model(dataset_name=RG_DATASET_NAME, model_output_dir=MODEL
     # Define the question name used during Argilla labelling
     question_name_for_annotation = "ner_question"
     processed_records_count = 0
+    processed_example_for_debug = None # Initialize variable to store the processed example if found
 
     # Iterate through the records obtained from the dataset object
     for record in records_iterator:
@@ -385,7 +384,13 @@ def train_span_marker_model(dataset_name=RG_DATASET_NAME, model_output_dir=MODEL
                     # print(f"Debug: Could not align annotation '{label}' ({start_char}, {end_char}) ...")
 
             # Add the processed data to the list for the Hugging Face Dataset
-            hf_dataset_list.append({"tokens": tokens, "ner_tags": ner_tags})
+            processed_data = {"tokens": tokens, "ner_tags": ner_tags}
+            # --- Store one specific example containing 'Instagram' for later debugging ---
+            if 'Instagram' in text and processed_example_for_debug is None:
+                processed_example_for_debug = processed_data
+                print(f"--- Debug: Found and stored an 'Instagram' example for inspection later. ---")
+            # --- End Store Debug ---
+            hf_dataset_list.append(processed_data)
             processed_records_count += 1 # Increment count *after* successful processing
 
         except Exception as e:
@@ -396,10 +401,22 @@ def train_span_marker_model(dataset_name=RG_DATASET_NAME, model_output_dir=MODEL
     # --- End of Record Processing Loop --- 
 
     if not hf_dataset_list:
-        print("No valid annotated records found or processed after filtering. Aborting training.")
+        print("Error: No valid annotated records found or processed after filtering. Aborting training.")
         return
 
-    print(f"Successfully processed {processed_records_count} submitted records from Argilla for training.")
+    print(f"--- Debug: Successfully processed {processed_records_count} submitted records into hf_dataset_list ({len(hf_dataset_list)} entries). ---")
+
+    # --- Print the stored problematic example if found ---
+    if processed_example_for_debug:
+        print("--- Debug: Inspecting the stored 'Instagram' example --- ")
+        tokens_str = " ".join(processed_example_for_debug.get('tokens', [])) if isinstance(processed_example_for_debug.get('tokens'), list) else str(processed_example_for_debug.get('tokens', []))
+        tags_str = " ".join(processed_example_for_debug.get('ner_tags', [])) if isinstance(processed_example_for_debug.get('ner_tags'), list) else str(processed_example_for_debug.get('ner_tags', []))
+        print(f"  Tokens: {tokens_str}")
+        print(f"  Tags (String): {tags_str}")
+        print("--- End Instagram Example Inspection --- ")
+    else:
+        print("--- Debug: No example containing 'Instagram' was found or stored during processing. --- ")
+    # --- End Print Problematic Example ---
 
     # --- Prepare Hugging Face Dataset --- 
     # Create the dataset from the list of processed records
@@ -425,9 +442,9 @@ def train_span_marker_model(dataset_name=RG_DATASET_NAME, model_output_dir=MODEL
     train_dataset = train_eval_dataset["train"]
     eval_dataset = train_eval_dataset["test"]
 
-    print(f"Training samples: {len(train_dataset)}, Evaluation samples: {len(eval_dataset)}")
+    print(f"--- Debug: Training samples: {len(train_dataset)}, Evaluation samples: {len(eval_dataset)} ---")
 
-    # --- Initialize SpanMarker Model --- 
+    # --- Initialize SpanMarker Model ---
     print(f"Initializing SpanMarkerModel with base: {BASE_MODEL}")
     model = SpanMarkerModel.from_pretrained(
         BASE_MODEL,
@@ -437,8 +454,8 @@ def train_span_marker_model(dataset_name=RG_DATASET_NAME, model_output_dir=MODEL
         marker_max_length=128,      # Max length for span markers (usually default is fine)
         entity_max_length=10,       # Max length of entity spans to consider (adjust based on typical code length)
         # Provide label mappings for custom datasets (needed if labels differ from pretrained config)
-        id2label=id2label,          # Mapping used internally by the model/trainer
-        label2id=label2id,
+        id2label=id2label,          # RESTORED: Provide the full map with B/I tags
+        label2id=label2id,          # RESTORED: Provide the full map with B/I tags
         # Optional: Add model card data for documentation/sharing
         model_card_data=SpanMarkerModelCardData(
             model_id=NEW_MODEL_NAME,
@@ -475,7 +492,7 @@ def train_span_marker_model(dataset_name=RG_DATASET_NAME, model_output_dir=MODEL
         save_strategy="epoch",          # Save a checkpoint at the end of each epoch
         save_total_limit=1,             # Keep only the best checkpoint
         load_best_model_at_end=True,    # Load the best model found during training
-        metric_for_best_model="eval_f1", # Use F1 score on eval set to determine best model
+        metric_for_best_model="eval_overall_f1", # Use F1 score on eval set to determine best model
         use_mps_device=use_mps,         # Enable MPS if available
         # M2 Max supports BF16 and MPS – please change the following variables if you don't have a compatible GPU
         bf16=True,                      # Enable BF16 since M2 Max supports it
@@ -501,7 +518,9 @@ def train_span_marker_model(dataset_name=RG_DATASET_NAME, model_output_dir=MODEL
     # --- Evaluate the Final Model --- 
     print("Evaluating final model performance on the evaluation set...")
     metrics = trainer.evaluate(eval_dataset, metric_key_prefix="eval")
-    print("Evaluation metrics:", metrics)
+    print("--- Final Evaluation Metrics ---:")
+    print(metrics)
+    print("------------------------------")
     trainer.save_metrics("eval", metrics)
 
     # --- Save the Trained Model --- 
@@ -526,33 +545,42 @@ def extract_codes_with_model(messages, model_path=MODEL_OUTPUT_DIR / "checkpoint
    output_dir_str = str(MODEL_OUTPUT_DIR) # Base output dir for fallback check
 
    # Check if the final checkpoint path exists, otherwise try the base output directory
-   if not Path(model_path_str).exists():
-       print(f"Checkpoint path {model_path_str} not found.")
-       if Path(output_dir_str).exists() and Path(output_dir_str, "config.json").exists():
-           print(f"Attempting to load directly from base directory {output_dir_str}...")
-           model_path_str = output_dir_str
-       else:
-            print(f"Error: Model not found at specified path '{model_path_str}' or base directory '{output_dir_str}'. Please train the model first or check the path.")
-            return None
+   effective_model_path = ""
+   if Path(model_path_str).exists() and Path(model_path_str, "config.json").exists():
+       effective_model_path = model_path_str
+   elif Path(output_dir_str).exists() and Path(output_dir_str, "config.json").exists():
+       print(f"Warning: Checkpoint path {model_path_str} not found or invalid. Attempting to load from base directory {output_dir_str}...")
+       effective_model_path = output_dir_str
+   else:
+        print(f"Error: Model not found at specified path '{model_path_str}' or base directory '{output_dir_str}'. Please train the model first or check the path.")
+        return None
 
-   print(f"Loading trained SpanMarker model from {model_path_str}...")
+   print(f"--- Debug: Loading trained SpanMarker model from: {effective_model_path} ---")
    try:
-       model = SpanMarkerModel.from_pretrained(model_path_str)
+       model = SpanMarkerModel.from_pretrained(effective_model_path)
        # Optionally move to GPU if available and desired for faster inference
        # if torch.cuda.is_available(): model.cuda()
        # elif torch.backends.mps.is_available(): model.to('mps')
    except Exception as e:
-       print(f"Error loading model from {model_path_str}: {e}")
+       print(f"Error loading model from {effective_model_path}: {e}")
        return None
 
    print(f"Extracting codes from {len(messages)} message(s)...")
    # Run batch prediction
    extracted_entities_batch = model.predict(messages)
 
+   # --- Debug: Print raw model output ---
+   print("--- Debug: Raw model predictions (before filtering) ---")
+   for i, raw_preds in enumerate(extracted_entities_batch):
+       print(f"Message {i}: {raw_preds}")
+   print("--- End Debug --- ")
+   # --- End Debug ---
+
    # Process results: Extract only the text span for entities labelled 'CODE'
    extracted_codes = []
    for message_entities in extracted_entities_batch:
-        codes_in_message = [entity['span'] for entity in message_entities if entity['label'] == 'CODE']
+        # Check if the label contains the base label 'CODE' (handles B-CODE and I-CODE)
+        codes_in_message = [entity['span'] for entity in message_entities if 'CODE' in entity['label']]
         extracted_codes.append(codes_in_message)
 
    # Example of how to push the model to the Hugging Face Hub:
@@ -591,6 +619,5 @@ def extract_codes_with_model(messages, model_path=MODEL_OUTPUT_DIR / "checkpoint
 
 # --- Main Execution Guard --- 
 if __name__ == "__main__":
-    print("Script execution started. Uncomment function calls (label_messages_for_ner, train_span_marker_model, example usage) to run specific steps.")
     print("Thank you for using Security Autofill 🙇")
     pass # Keeps the script runnable without uncommenting steps

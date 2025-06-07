@@ -5,3 +5,4 @@ model_output/
 security-code-detector-semisupervised*/
 security-code-detector-semisupervised/
 *.bak
+models/
